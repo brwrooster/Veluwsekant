@@ -276,7 +276,10 @@ class Dienst:
                 "klok_ok": klok_gesynchroniseerd(),
             }
             self.items.append(it)
-            if it["eigen"] and (not self.online or self.venster_sinds is not None):
+            # Alleen als we zeker offline zijn houdt dit alarm het offline-scherm open. Een alarm dat
+            # gewoon bij de Worker aankomt, laat het gewone scherm zelf zien; dat telt hier niet mee
+            # (anders houdt elke testoproep het offline-scherm eindeloos open).
+            if it["eigen"] and not self.online:
                 self.venster_tot = max(self.venster_tot, time.monotonic() + self.venster_minimaal())
             self.opslaan()
             return it["id"]
@@ -303,8 +306,13 @@ class Dienst:
                     break
             else:
                 return False
-            if not bezorgd and self.online:
-                self.markeer_offline("het doorsturen naar de Worker mislukte")
+            if not bezorgd and it["eigen"] and not it["test"]:
+                # Dit alarm kwam NIET bij de Worker aan: het gewone scherm weet er niets van, dus het
+                # offline-scherm moet het ook volle tijd tonen. (Een mislukte melding voor een andere
+                # post zegt niets over ons eigen scherm en schakelt dus niets om.)
+                self.venster_tot = max(self.venster_tot, it["t_mono"] + self.venster_minimaal())
+                if self.online:
+                    self.markeer_offline("het doorsturen naar de Worker mislukte")
             self.opslaan()
             return True
 
