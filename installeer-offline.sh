@@ -134,6 +134,7 @@ STANDAARD = {
     "max_leeftijd_uur": 48,      # ouder dan dit: niet meer nasturen (de Worker weigert ze ook)
     "venster_start": None,       # opdracht (lijst) om het offline-scherm te tonen
     "venster_stop": None,        # opdracht (lijst) om het weer weg te halen
+    "venster_opruim": None,      # opdracht (lijst) bij het starten van de dienst: een achtergebleven offline-scherm opruimen
 }
 
 ASSET_PAD = re.compile(r"^/((?:image/)?[A-Za-z0-9_.-]+\.(?:png|jpe?g|gif|svg|webp|ico))$", re.I)
@@ -581,6 +582,9 @@ class Dienst:
                 break
 
     def lus(self):
+        # Na een herstart van deze dienst kan er nog een offline-scherm van de vorige keer staan
+        # (de dienst laat het scherm bewust draaien als hij zelf herstart). Eerst opruimen.
+        self.voer_uit(self.cfg.get("venster_opruim"))
         while True:
             try:
                 self.ronde()
@@ -1026,39 +1030,126 @@ P2000_EINDE_PATCH_ONTVANGER_PY
 cat > "$MAP/offline_venster.sh" <<'P2000_EINDE_OFFLINE_VENSTER_SH'
 #!/bin/bash
 # Het offline-scherm tonen of weghalen.
-#   bash offline_venster.sh start   -> opent een tweede Chromium (eigen profiel) op het offline-scherm
-#   bash offline_venster.sh stop    -> sluit dat venster weer; het gewone scherm is dan weer zichtbaar
+#   bash offline_venster.sh start     -> het offline-scherm tonen
+#   bash offline_venster.sh stop      -> het offline-scherm weghalen; het gewone scherm is dan weer te zien
+#   bash offline_venster.sh opruimen  -> bij het starten van de offline-dienst: een achtergebleven offline-scherm opruimen
 # De offline-dienst roept dit zelf aan; je hoeft er niets mee.
-PROFIEL=/tmp/p2000-offline-profiel
+#
+# Twee manieren (staat in offline_instellingen.json, 'venster_modus'):
+#   tweede  = er opent een TWEEDE Chromium bovenop het gewone scherm (Pi's met genoeg geheugen, en de demo).
+#   vervang = het gewone scherm wordt gesloten en het offline-scherm komt in de plaats; daarna komt
+#             het gewone scherm weer terug. Er draait dan steeds maar EEN browser (Pi 3 met 1 GB).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+INST="${P2000_OFFLINE_INSTELLINGEN:-$DIR/offline_instellingen.json}"
+PROFIEL="${P2000_OFFLINE_PROFIEL:-/tmp/p2000-offline-profiel}"
+MARKER="${P2000_OFFLINE_MARKER:-/tmp/p2000-offline-gestopt}"
 URL="http://127.0.0.1:${P2000_OFFLINE_POORT:-8765}/?offline=1"
+
+lees() {
+  python3 - "$INST" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2]) or "")
+except Exception:
+    print("")
+PY
+}
+MODUS="$(lees venster_modus)"
+HOOFD_START="$(lees hoofd_start)"
+HOOFD_PATROON="$(lees hoofd_patroon)"
+# Is de vervang-modus niet helemaal ingesteld? Dan veilig terugvallen op het tweede venster.
+if [ "$MODUS" = "vervang" ] && { [ -z "$HOOFD_START" ] || [ -z "$HOOFD_PATROON" ]; }; then MODUS="tweede"; fi
+
+zet_wayland() {
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+      case "$s" in *.lock) continue ;; esac
+      if [ -S "$s" ]; then export WAYLAND_DISPLAY="$(basename "$s")"; break; fi
+    done
+  fi
+  export DISPLAY="${DISPLAY:-:0}"
+}
+
+hoofd_draait() { pgrep -f -- "$HOOFD_PATROON" >/dev/null 2>&1; }
+
+stop_hoofd() {
+  hoofd_draait || return 0
+  pkill -TERM -f -- "$HOOFD_PATROON" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    hoofd_draait || return 0
+    sleep 0.5
+  done
+  pkill -KILL -f -- "$HOOFD_PATROON" 2>/dev/null
+  sleep 0.5
+}
+
+start_hoofd() {
+  hoofd_draait && return 0
+  zet_wayland
+  # eigen sessie, zodat het gewone scherm blijft draaien ook als deze dienst herstart
+  setsid bash -c "exec $HOOFD_START" </dev/null >/dev/null 2>&1 &
+}
+
+offline_chromium() {
+  CHR="$(command -v chromium || command -v chromium-browser)"
+  [ -n "$CHR" ] || { echo "Chromium niet gevonden"; return 1; }
+  OFFLINE_CMD=("$CHR" --user-data-dir="$PROFIEL" --kiosk --noerrdialogs --disable-infobars --no-first-run
+    --no-default-browser-check --disable-session-crashed-bubble --password-store=basic
+    --disable-background-networking --disable-sync
+    --autoplay-policy=no-user-gesture-required "$URL")
+}
+
+ruim_profiel_op() {
+  pkill -f -- "--user-data-dir=$PROFIEL" 2>/dev/null
+  sleep 0.5
+  rm -rf "$PROFIEL" 2>/dev/null
+}
+
 case "${1:-}" in
   start)
+    rm -f "$MARKER" 2>/dev/null
     pkill -f -- "--user-data-dir=$PROFIEL" 2>/dev/null
     sleep 0.3
     rm -rf "$PROFIEL" 2>/dev/null
-    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
-      for s in "$XDG_RUNTIME_DIR"/wayland-*; do
-        case "$s" in *.lock) continue ;; esac
-        if [ -S "$s" ]; then export WAYLAND_DISPLAY="$(basename "$s")"; break; fi
-      done
+    zet_wayland
+    offline_chromium || exit 1
+    if [ "$MODUS" != "vervang" ]; then
+      exec "${OFFLINE_CMD[@]}" >/dev/null 2>&1
     fi
-    export DISPLAY="${DISPLAY:-:0}"
-    CHR="$(command -v chromium || command -v chromium-browser)"
-    [ -n "$CHR" ] || { echo "Chromium niet gevonden"; exit 1; }
-    exec "$CHR" --user-data-dir="$PROFIEL" --kiosk --noerrdialogs --disable-infobars --no-first-run \
-      --no-default-browser-check --disable-session-crashed-bubble --password-store=basic \
-      --disable-background-networking --disable-sync \
-      --autoplay-policy=no-user-gesture-required "$URL" >/dev/null 2>&1
+    # vervang-modus: eerst het gewone scherm sluiten, dan het offline-scherm tonen
+    stop_hoofd
+    "${OFFLINE_CMD[@]}" >/dev/null 2>&1 &
+    CP=$!
+    trap 'kill "$CP" 2>/dev/null; exit 0' TERM INT HUP
+    wait "$CP"
+    # Het offline-scherm is gestopt. Door 'stop' (dan staat de markering er en zet 'stop' het gewone scherm terug)
+    # of onverwacht (gecrasht of niet gestart)? Dan zetten wij het gewone scherm zelf terug, zodat het scherm nooit leeg blijft.
+    if [ ! -e "$MARKER" ]; then start_hoofd; fi
+    exit 0
     ;;
   stop)
-    pkill -f -- "--user-data-dir=$PROFIEL" 2>/dev/null
-    sleep 0.5
-    rm -rf "$PROFIEL" 2>/dev/null
+    : > "$MARKER" 2>/dev/null
+    ruim_profiel_op
+    if [ "$MODUS" = "vervang" ]; then start_hoofd; fi
+    exit 0
+    ;;
+  opruimen)
+    # De dienst is (opnieuw) gestart. Een offline-scherm van de vorige keer opruimen.
+    # Eerst de markering zetten: een achtergebleven start-script zet dan het gewone scherm NIET zelf terug
+    # (dat doen wij hieronder), anders kunnen er twee komen.
+    : > "$MARKER" 2>/dev/null
+    ruim_profiel_op
+    if [ "$MODUS" = "vervang" ]; then
+      # Het gewone scherm terugzetten als het weg is. Niet vlak na het opstarten van de Pi: dan start
+      # het gewone scherm zelf (autostart) en zouden er twee komen.
+      UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"
+      if [ "${UP:-0}" -gt "${P2000_OFFLINE_MIN_UPTIME:-180}" ]; then start_hoofd; fi
+    fi
     exit 0
     ;;
   *)
-    echo "gebruik: bash offline_venster.sh start|stop"
+    echo "gebruik: bash offline_venster.sh start|stop|opruimen"
     exit 1
     ;;
 esac
@@ -1162,12 +1253,67 @@ if not gekozen.get("worker_url") or not gekozen.get("sleutel"):
 basis = re.sub(r"/api/pi/?$", "", gekozen["worker_url"].rstrip("/"))
 uit = {"basis": basis, "sleutel": gekozen["sleutel"], "poort": 8765, "map": os.path.join(m, "offline_data"),
        "venster_start": ["/bin/bash", os.path.join(m, "offline_venster.sh"), "start"],
-       "venster_stop": ["/bin/bash", os.path.join(m, "offline_venster.sh"), "stop"]}
+       "venster_stop": ["/bin/bash", os.path.join(m, "offline_venster.sh"), "stop"],
+       "venster_opruim": ["/bin/bash", os.path.join(m, "offline_venster.sh"), "opruimen"]}
+
+# ---- hoe komt het offline-scherm op het scherm?
+#   tweede  = een tweede Chromium bovenop het gewone scherm (genoeg geheugen, of geen kiosk)
+#   vervang = het gewone scherm sluit tijdelijk en komt daarna weer terug (weinig geheugen, bv. Pi 3 met 1 GB)
+import subprocess
+wens = os.environ.get("MODUS", "").strip().lower()
+if wens not in ("", "tweede", "vervang"):
+    print("  LET OP  MODUS=%s ken ik niet (kies tweede of vervang); ik kies zelf." % wens)
+    wens = ""
+ram_mb = 0
+try:
+    ram_mb = int(re.search(r"MemTotal:\s+(\d+)", open(os.environ.get("P2000_MEMINFO", "/proc/meminfo")).read()).group(1)) // 1024
+except Exception:
+    pass
+start = patroon = ""
+auto = os.path.expanduser("~/.config/labwc/autostart")
+try:
+    tekst = open(auto, encoding="utf-8").read().replace("\\\n", " ")
+    for regel in tekst.splitlines():
+        r = regel.strip()
+        if not r or r.startswith("#") or "chromium" not in r or "--kiosk" not in r:
+            continue
+        if r.endswith("&"):
+            r = r[:-1].rstrip()
+        if any(t in r for t in (";", "&", "|", "(", ")", "`", "$(")):
+            print("  LET OP  de Chromium-regel in de autostart is te ingewikkeld voor mij (%s)" % r[:60])
+            continue
+        url = next((t for t in r.split() if re.match(r"^(https?|file)://", t)), "")
+        if not url:
+            continue
+        start = r
+        patroon = "chromium.*" + re.sub(r"([.?+*\[\](){}|^$\\])", r"\\\1", url)
+        break
+except Exception:
+    pass
+modus = wens or ("vervang" if (start and 0 < ram_mb < 1500) else "tweede")
+if modus == "vervang" and not start:
+    print("  LET OP  geen kiosk-regel gevonden in %s; ik gebruik een tweede venster." % auto)
+    modus = "tweede"
+if modus == "vervang":
+    gevonden = subprocess.run(["pgrep", "-f", "--", patroon], capture_output=True).returncode == 0
+    if not gevonden:
+        print("  LET OP  ik zie het gewone scherm nu niet draaien met die regel (staat het scherm aan?).")
+        if not wens:
+            print("          Daarom kies ik het tweede venster. Start het scherm en draai dit nog eens, of kies zelf: MODUS=vervang bash installeer_offline.sh")
+            modus = "tweede"
+uit["venster_modus"] = modus
+if modus == "vervang":
+    uit["hoofd_start"] = start
+    uit["hoofd_patroon"] = patroon
 pad = os.path.join(m, "offline_instellingen.json")
 with open(pad, "w", encoding="utf-8") as f:
     json.dump(uit, f, indent=2)
 os.chmod(pad, 0o600)
 print("  OK      scherm van deze Pi: '%s' op %s" % (gekozen.get("naam", "?"), basis))
+if modus == "vervang":
+    print("  OK      offline-scherm: het gewone scherm gaat tijdelijk dicht en komt daarna vanzelf terug (geheugen: %d MB)" % ram_mb)
+else:
+    print("  OK      offline-scherm: opent als tweede venster bovenop het gewone scherm (geheugen: %d MB)" % ram_mb)
 if len(doelen) > 1:
     print("  LET OP  deze Pi heeft %d doelen (%s). Hoort het scherm bij een andere?  Draai dan:  DOEL=naam bash installeer_offline.sh"
           % (len(doelen), ", ".join(str(d.get("naam")) for d in doelen)))
@@ -1190,6 +1336,8 @@ WorkingDirectory=$MAP
 ExecStart=$(command -v python3) $MAP/offline_dienst.py $MAP/offline_instellingen.json
 Restart=always
 RestartSec=3
+# Bij een herstart van deze dienst blijft het scherm gewoon staan (het gewone scherm wordt door deze dienst gestart)
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
