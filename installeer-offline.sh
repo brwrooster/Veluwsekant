@@ -125,7 +125,8 @@ STANDAARD = {
     "uit_na": 3,                 # zo vaak achter elkaar mislukt = offline
     "aan_na": 2,                 # zo vaak achter elkaar gelukt = weer online
     "onbevestigd_sec": 90,       # geen bevestiging van ontvanger.py? dan alsnog nasturen
-    "min_venster_sec": 360,      # offline-scherm minstens zo lang open na het laatste alarm
+    "open_min_sec": 90,          # offline-scherm minstens zo lang open na het OPENEN (tegen heen-en-weer springen)
+    "min_venster_sec": 360,      # na een ALARM minstens zo lang open (en minstens 'hoe lang een alarm blijft staan' + 1 minuut)
     "volg_holdmin": True,        # en minstens 'hoe lang een alarm blijft staan' + 1 minuut
     "ververs_taken_sec": 60,
     "ververs_scherm_sec": 6 * 3600,
@@ -422,7 +423,13 @@ class Dienst:
         if moet and self.venster_sinds is None:
             self.venster_sinds = nu
             self.venster_sinds_ms = int(time.time() * 1000)
-            self.venster_tot = max(self.venster_tot, nu + self.venster_minimaal())
+            tot = nu + self.cfg["open_min_sec"]
+            # Een alarm dat net voor het openen binnenkwam (de ontvanger wacht even op de Worker)
+            # moet ook gewoon zijn volle tijd op het scherm blijven staan.
+            for it in self.items:
+                if it["eigen"] and not it["test"] and it["bezorgd"] is not True and it.get("boot") == self.boot:
+                    tot = max(tot, it["t_mono"] + self.venster_minimaal())
+            self.venster_tot = max(self.venster_tot, tot)
             log("offline-scherm tonen")
             self.voer_uit(self.cfg.get("venster_start"), houd=True)
         elif not moet and self.venster_sinds is not None:
@@ -1033,7 +1040,8 @@ case "${1:-}" in
     [ -n "$CHR" ] || { echo "Chromium niet gevonden"; exit 1; }
     exec "$CHR" --user-data-dir="$PROFIEL" --kiosk --noerrdialogs --disable-infobars --no-first-run \
       --no-default-browser-check --disable-session-crashed-bubble --password-store=basic \
-      --autoplay-policy=no-user-gesture-required "$URL"
+      --disable-background-networking --disable-sync \
+      --autoplay-policy=no-user-gesture-required "$URL" >/dev/null 2>&1
     ;;
   stop)
     pkill -f -- "--user-data-dir=$PROFIEL" 2>/dev/null
@@ -1076,6 +1084,7 @@ case "${1:-}" in
     $SUDO sed -i '/# p2000-offline-test/d' "$HOSTS"
     $SUDO systemctl stop p2000-offline-test-terug.timer 2>/dev/null
     echo "De Worker is weer bereikbaar. Binnen ongeveer 10 seconden is de Pi weer online."
+    echo "Het offline-scherm blijft nog even staan (ongeveer 1,5 minuut; na een alarm langer) en gaat dan vanzelf weg."
     ;;
   *)
     echo "gebruik:  bash offline_simuleer.sh uit   of   bash offline_simuleer.sh aan"
