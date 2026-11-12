@@ -965,12 +965,17 @@ class Kaart:
         return data, soort
 
     def herschrijf(self, html):
-        """Het offline-scherm gebruikt de eigen kopie van Leaflet i.p.v. de internetversie."""
-        if not html or not self.lib_klaar():
+        """Het offline-scherm gebruikt de eigen kopie van Leaflet i.p.v. de internetversie.
+        Staan er ook kaartstukjes op de SD-kaart, dan krijgt de pagina een seintje
+        (window.P2000_KAART_OP_PI) dat ze offline een kaart mag tonen. Zonder dat seintje
+        toont de pagina offline geen kaart (zoals v4), ook als Leaflet via internet nog binnenkomt."""
+        if not html or not self.c.get("kaart", True) or not self.lib_klaar():
             return html
         try:
             for naam in LIB_VERPLICHT:
                 html = html.replace((LEAFLET_CDN + naam).encode(), ("/lokaal/lib/" + naam).encode())
+            if self._bytes > 0:
+                html = re.sub(rb"(<head[^>]*>)", rb"\1<script>window.P2000_KAART_OP_PI=true;</script>", html, count=1, flags=re.I)
         except Exception:
             pass
         return html
